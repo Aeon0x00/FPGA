@@ -1,0 +1,75 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.STD_LOGIC_ARITH.ALL;
+use IEEE.STD_LOGIC_UNSIGNED.ALL;
+
+-- Объявление сущности (entity)
+entity DinamicIndication is
+    Port (
+        clk  : in  STD_LOGIC;              - вход тактирования 50 МГц
+        dout : out STD_LOGIC_VECTOR(7 downto 0); - выход на 7-сег. индикатор
+        beep : out STD_LOGIC               - выход на зуммер
+    );
+end DinamicIndication;
+
+-- Архитектура
+architecture Behavioral of DinamicIndication is
+
+    -- Сигналы для делителя частоты
+    signal clk_div   : STD_LOGIC := '0';
+    signal cnt_div   : INTEGER range 0 to 49999999 := 0;
+
+    -- Сигнал-счётчик цифры (0..8, где 8 = звуковой сигнал)
+    signal seg       : STD_LOGIC_VECTOR(3 downto 0) := "0001";
+    signal step      : INTEGER range 0 to 10 := 1;
+
+    -- Счётчик для звукового сигнала (2 секунды)
+    signal beep_cnt  : INTEGER range 0 to 2 := 0;
+    signal beep_flag : STD_LOGIC := '0';
+
+begin
+
+    process(clk)
+    begin
+        if clk'event and clk = '1' then
+            if cnt_div = 49999999 then
+                cnt_div <= 0;
+                clk_div <= not clk_div;  -- переключение каждую секунду
+            else
+                cnt_div <= cnt_div + 1;
+            end if;
+        end if;
+    end process;
+
+    process(clk_div)
+    begin
+        if clk_div'event and clk_div = '1' then
+            if step <= 8 then
+                Перебираем цифры 1..8
+                case seg is
+                    when "0001" => dout <= "11111001"; seg <= "0010"; - 1
+                    when "0010" => dout <= "10100100"; seg <= "0011"; - 2
+                    when "0011" => dout <= "10110000"; seg <= "0100"; - 3
+                    when "0100" => dout <= "10011001"; seg <= "0101"; - 4
+                    when "0101" => dout <= "10010010"; seg <= "0110"; - 5
+                    when "0110" => dout <= "10000010"; seg <= "0111"; - 6
+                    when "0111" => dout <= "11111000"; seg <= "1000"; - 7
+                    when "1000" => dout <= "10000000"; -- 8
+                             beep_flag <= '1'; включаем зуммер
+                    when others => null;
+                end case;
+                step <= step + 1;
+            elsif beep_flag = '1' then
+                Звуковой сигнал: 2 секунды
+                if beep_cnt < 2 then
+                    beep <= '1';
+                    beep_cnt <= beep_cnt + 1;
+                else
+                    beep <= '0';
+                    beep_flag <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
