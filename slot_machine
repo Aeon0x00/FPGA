@@ -1,0 +1,236 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity slot_machine is
+    port (
+        clk      : in  std_logic; 
+        rst_n    : in  std_logic; 
+        swith_1  : in  std_logic; 
+
+        LED_A, LED_B, LED_C, LED_D, LED_E, LED_F, LED_G, LED_H : out std_logic;
+        LED_BIT0, LED_BIT1, LED_BIT2, LED_BIT3, LED_BIT4, LED_BIT5, LED_BIT6, LED_BIT7 : out std_logic;
+        BELL     : out std_logic  
+    );
+end slot_machine;
+
+architecture Behavioral of slot_machine is
+
+    constant CLK_FREQ_HZ     : natural := 50_000_000;
+    constant REFRESH_RATE_HZ : natural := 500;
+    constant DEBOUNCE_MS     : natural := 20;
+
+    
+    signal tick_slow     : std_logic := '0'; -- 4 Гц
+    signal tick_fast     : std_logic := '0'; -- 20 Гц
+    signal tick_display  : std_logic := '0';
+
+    
+    signal btn_sync      : std_logic_vector(1 downto 0) := (others => '0');
+    signal btn_db        : std_logic := '0';
+    signal btn_rising    : std_logic := '0';
+    signal deb_cnt       : natural range 0 to CLK_FREQ_HZ := 0;
+
+    
+    signal num_left      : std_logic_vector(15 downto 0) := x"1111";
+    signal num_right     : std_logic_vector(15 downto 0) := x"1111";
+    signal game_on       : std_logic := '0';
+    signal win           : std_logic := '0';
+    signal result_shown  : std_logic := '0';
+
+    
+    signal digit_sel     : unsigned(2 downto 0) := (others => '0');
+    signal seg_out       : std_logic_vector(7 downto 0) := (others => '1');
+    signal anode_out     : std_logic_vector(7 downto 0) := (others => '1');
+
+    
+    signal tone_toggle   : std_logic := '0';
+    signal buzzer_active : std_logic := '0';
+    signal result_prev   : std_logic := '0';
+    signal buzzer_out    : std_logic := '0';
+
+    
+    function bcd_to_seg(digit : std_logic_vector(3 downto 0)) return std_logic_vector is
+    begin
+        case digit is
+            when "0001" => return "1111001"; when "0010" => return "0100100"; 
+            when "0011" => return "0110000"; when "0100" => return "0011001"; 
+            when "0101" => return "0010010"; when "0110" => return "0000010"; 
+            when "0111" => return "1111000"; when "1000" => return "0000000"; 
+            when "1001" => return "0010000"; when others => return "1000000"; 
+        end case;
+    end function;
+
+    
+    function char_to_seg(c : natural) return std_logic_vector is
+    begin
+        case c is
+            when 0 => return "0001001"; -- Y
+            when 1 => return "0101111"; -- r
+            when 2 => return "0001000"; -- A
+            when 4 => return "1000111"; -- L
+            when 5 => return "0000110"; -- E
+            when 6 => return "0101000"; -- R
+            when 7 => return "0000111"; -- t
+            when others => return "1111111";
+        end case;
+    end function;
+
+    
+    function bcd_step(val : std_logic_vector(15 downto 0); step : integer) return std_logic_vector is
+        variable d0, d1, d2, d3 : integer;
+    begin
+        d0 := to_integer(unsigned(val(3 downto 0))) + step;
+        if d0 > 9 then d0 := d0 - 9; end if;
+        if d0 < 1 then d0 := 1; end if;
+
+        d1 := to_integer(unsigned(val(7 downto 4))) + step;
+        if d1 > 9 then d1 := d1 - 9; end if;
+        if d1 < 1 then d1 := 1; end if;
+
+        d2 := to_integer(unsigned(val(11 downto 8))) + step;
+        if d2 > 9 then d2 := d2 - 9; end if;
+        if d2 < 1 then d2 := 1; end if;
+
+        d3 := to_integer(unsigned(val(15 downto 12))) + step;
+        if d3 > 9 then d3 := d3 - 9; end if;
+        if d3 < 1 then d3 := 1; end if;
+
+        return std_logic_vector(to_unsigned(d3, 4)) & std_logic_vector(to_unsigned(d2, 4)) & 
+               std_logic_vector(to_unsigned(d1, 4)) & std_logic_vector(to_unsigned(d0, 4));
+    end function;
+
+begin
+
+    
+    LED_A <= seg_out(0); LED_B <= seg_out(1); LED_C <= seg_out(2); LED_D <= seg_out(3);
+    LED_E <= seg_out(4); LED_F <= seg_out(5); LED_G <= seg_out(6); LED_H <= '1';
+    LED_BIT0 <= anode_out(0); LED_BIT1 <= anode_out(1); LED_BIT2 <= anode_out(2); LED_BIT3 <= anode_out(3);
+    LED_BIT4 <= anode_out(4); LED_BIT5 <= anode_out(5); LED_BIT6 <= anode_out(6); LED_BIT7 <= anode_out(7);
+    BELL <= buzzer_out;
+
+    
+    process(clk, rst_n)
+        variable c_slow : natural range 0 to CLK_FREQ_HZ := 0;
+        variable c_fast : natural range 0 to CLK_FREQ_HZ := 0;
+        variable c_disp : natural range 0 to CLK_FREQ_HZ := 0;
+    begin
+        if rst_n = '0' then
+            c_slow := 0; c_fast := 0; c_disp := 0;
+            tick_slow <= '0'; tick_fast <= '0'; tick_display <= '0';
+        elsif rising_edge(clk) then
+            tick_slow <= '0'; tick_fast <= '0'; tick_display <= '0';
+            if c_slow >= (CLK_FREQ_HZ / 4) - 1 then c_slow := 0; tick_slow <= '1'; else c_slow := c_slow + 1; end if;
+            if c_fast >= (CLK_FREQ_HZ / 20) - 1 then c_fast := 0; tick_fast <= '1'; else c_fast := c_fast + 1; end if;
+            if c_disp >= (CLK_FREQ_HZ / REFRESH_RATE_HZ) - 1 then c_disp := 0; tick_display <= '1'; else c_disp := c_disp + 1; end if;
+        end if;
+    end process;
+
+    
+    process(clk, rst_n)
+    begin
+        if rst_n = '0' then
+            btn_sync <= (others => '0'); btn_db <= '0'; btn_rising <= '0'; deb_cnt <= 0;
+        elsif rising_edge(clk) then
+            btn_sync(0) <= not swith_1; btn_sync(1) <= btn_sync(0); btn_rising <= '0';
+            if btn_sync(1) /= btn_db then
+                if deb_cnt >= (CLK_FREQ_HZ * DEBOUNCE_MS / 1000) then
+                    deb_cnt <= 0;
+                    if btn_sync(1) = '1' and btn_db = '0' then btn_rising <= '1'; end if;
+                    btn_db <= btn_sync(1);
+                else deb_cnt <= deb_cnt + 1; end if;
+            else deb_cnt <= 0; end if;
+        end if;
+    end process;
+
+    
+    process(clk, rst_n)
+    begin
+        if rst_n = '0' then
+            game_on <= '0'; win <= '0'; result_shown <= '0';
+            num_left <= x"1111"; num_right <= x"1111";
+        elsif rising_edge(clk) then
+            if game_on = '1' then
+                -- Левый прибавляет по 2222
+                if tick_slow = '1' then num_left <= bcd_step(num_left, 2); end if;
+                -- Правый прибавляет по 5555
+                if tick_fast = '1' then num_right <= bcd_step(num_right, 5); end if;
+            end if;
+            if btn_rising = '1' then
+                if result_shown = '1' then
+                    result_shown <= '0'; game_on <= '0';
+                    num_left <= x"1111"; num_right <= x"1111";
+                elsif game_on = '0' then game_on <= '1';
+                else
+                    game_on <= '0'; result_shown <= '1';
+                    if num_left = num_right then win <= '1'; else win <= '0'; end if;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    
+    process(clk, rst_n)
+        variable seg_v   : std_logic_vector(6 downto 0);
+        variable digit_v : std_logic_vector(3 downto 0);
+    begin
+        if rst_n = '0' then
+            digit_sel <= (others => '0'); anode_out <= (others => '1');
+        elsif rising_edge(clk) then
+            if tick_display = '1' then
+                anode_out <= (others => '1');
+                digit_sel <= digit_sel + 1;
+                if result_shown = '1' and win = '1' then
+                    case to_integer(digit_sel) is
+                        when 2 => seg_v := char_to_seg(0); when 3 => seg_v := char_to_seg(1); 
+                        when 4 => seg_v := char_to_seg(2); when others => seg_v := "1111111";
+                    end case;
+                elsif result_shown = '1' and win = '0' then
+                    case to_integer(digit_sel) is
+                        when 1 => seg_v := char_to_seg(2); when 2 => seg_v := char_to_seg(4); 
+                        when 3 => seg_v := char_to_seg(5); when 4 => seg_v := char_to_seg(6); 
+                        when 5 => seg_v := char_to_seg(7); when others => seg_v := "1111111";
+                    end case;
+                else
+                    case to_integer(digit_sel) is
+                        when 0 => digit_v := num_right(3 downto 0); when 1 => digit_v := num_right(7 downto 4);
+                        when 2 => digit_v := num_right(11 downto 8); when 3 => digit_v := num_right(15 downto 12);
+                        when 4 => digit_v := num_left(3 downto 0); when 5 => digit_v := num_left(7 downto 4);
+                        when 6 => digit_v := num_left(11 downto 8); when 7 => digit_v := num_left(15 downto 12);
+                        when others => digit_v := "0001";
+                    end case;
+                    seg_v := bcd_to_seg(digit_v);
+                end if;
+                seg_out(6 downto 0) <= seg_v;
+                anode_out(to_integer(digit_sel)) <= '0';
+            end if;
+        end if;
+    end process;
+
+  
+    process(clk, rst_n)
+        variable tone_cnt : natural range 0 to 50000 := 0;
+        variable dur_cnt  : natural range 0 to CLK_FREQ_HZ := 0;
+        variable tone_val : natural := 25000;
+        variable dur_lim  : natural := CLK_FREQ_HZ;
+    begin
+        if rst_n = '0' then buzzer_active <= '0'; buzzer_out <= '0'; result_prev <= '0';
+        elsif rising_edge(clk) then
+            if result_shown = '1' and result_prev = '0' then
+                buzzer_active <= '1'; dur_cnt := 0; tone_cnt := 0;
+                if win = '1' then tone_val := 25000; dur_lim := CLK_FREQ_HZ;
+                else tone_val := 50000; dur_lim := CLK_FREQ_HZ / 2; end if;
+            end if;
+            result_prev <= result_shown;
+            if buzzer_active = '1' then
+                if dur_cnt >= dur_lim then buzzer_active <= '0'; buzzer_out <= '0';
+                else
+                    dur_cnt := dur_cnt + 1;
+                    if tone_cnt >= tone_val then tone_cnt := 0; tone_toggle <= not tone_toggle;
+                    else tone_cnt := tone_cnt + 1; end if;
+                    buzzer_out <= tone_toggle;
+                end if;
+            else buzzer_out <= '0'; end if;
+        end if;
+    end process;
+end Behavioral;
