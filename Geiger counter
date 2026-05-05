@@ -1,0 +1,236 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.STD_LOGIC_UNSIGNED.ALL;
+
+entity laba10 is 
+    Port ( 
+        clk        : in  STD_LOGIC;                      -- 50 МГц
+        btn_pulse  : in  STD_LOGIC;                      -- Кнопка K2 (Счетчик)
+        btn_reset  : in  STD_LOGIC;                      -- Кнопка K3 (Сброс)
+        seg        : out STD_LOGIC_VECTOR (7 downto 0);  -- Сегменты дисплея
+        dig        : out STD_LOGIC_VECTOR (7 downto 0);  -- Разряды дисплея
+        tx         : out STD_LOGIC                       -- Линия передачи UART (на ПК)                      
+    );
+end laba10;
+
+architecture Behavioral of laba10 is
+
+    -- Константы
+    constant T_10_SEC  : integer := 500000000; 
+    constant T_1_MS    : integer := 50000;     
+    constant BAUD_TICK : integer := 5208;      
+    constant T_DB      : integer := 1000000;   -- Антидребезг (20 мс - оптимально для тактовых кнопок)
+
+    -- Таймеры и счетчики
+    signal timer_10s   : integer range 0 to T_10_SEC := 0;
+    signal timer_1ms   : integer range 0 to T_1_MS := 0;
+    
+    signal pulse_count   : integer range 0 to 9 := 0; 
+    signal count_to_send : integer range 0 to 9 := 0; 
+    
+    signal scan_cnt    : integer range 0 to 7 := 0;    
+    signal is_alert    : std_logic := '0';             
+    
+    -- ПРОМЫШЛЕННЫЙ АНТИДРЕБЕЗГ
+    signal cnt_p   : integer range 0 to T_DB := 0;
+    signal cnt_r   : integer range 0 to T_DB := 0;
+    signal clean_p : std_logic := '1'; -- Очищенный сигнал кнопки импульсов
+    signal clean_r : std_logic := '1'; -- Очищенный сигнал кнопки сброса
+
+    -- Детекторы фронта (работают уже с очищенным сигналом)
+    signal reg_p : std_logic_vector(1 downto 0) := "11";
+    signal reg_r : std_logic_vector(1 downto 0) := "11";
+
+    -- СИГНАЛЫ ДЛЯ UART TX
+    type tx_state_type is (IDLE, START_BIT, DATA_BITS, STOP_BIT);
+    signal tx_state    : tx_state_type := IDLE;
+    signal baud_cnt    : integer range 0 to BAUD_TICK := 0;
+    signal bit_idx     : integer range 0 to 7 := 0;
+    
+    signal tx_data_reg : std_logic_vector(7 downto 0) := (others => '0');
+    signal tx_start    : std_logic := '0';
+    signal tx_busy     : std_logic := '0';
+    
+    signal msg_step    : integer range 0 to 10 := 0;
+    signal send_trigger: std_logic := '0';
+
+begin
+
+    -- ПРОЦЕСС 1: Таймеры, Антидребезг и Счетчик
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- 1. Развертка экрана
+            if timer_1ms = T_1_MS - 1 then
+                timer_1ms <= 0; scan_cnt <= scan_cnt + 1;
+            else timer_1ms <= timer_1ms + 1; end if;
+
+            -- 2. ИДЕАЛЬНЫЙ АНТИДРЕБЕЗГ КНОПОК
+            -- Кнопка импульсов (K2)
+            if btn_pulse = clean_p then
+                cnt_p <= 0; -- Если сигнал стабилен, сбрасываем счетчик колебаний
+            else
+                cnt_p <= cnt_p + 1; -- Если сигнал изменился, ждем...
+                if cnt_p = T_DB then
+                    clean_p <= btn_pulse; -- Сигнал стабилен 20мс! Принимаем новое состояние.
+                    cnt_p <= 0;
+                end if;
+            end if;
+
+            -- Кнопка сброса (K3)
+            if btn_reset = clean_r then
+                cnt_r <= 0;
+            else
+                cnt_r <= cnt_r + 1;
+                if cnt_r = T_DB then
+                    clean_r <= btn_reset;
+                    cnt_r <= 0;
+                end if;
+            end if;
+
+            -- 3. Детектирование фронта ТОЛЬКО на очищенном сигнале
+            reg_p <= reg_p(0) & clean_p;
+            reg_r <= reg_r(0) & clean_r;
+
+            -- 4. ЛОГИКА СЧЕТЧИКА
+            -- Сброс (K3)
+            if reg_r = "10" then 
+                is_alert <= '0'; pulse_count <= 0; timer_10s <= 0; send_trigger <= '0';
+            end if;
+
+            -- Считаем импульсы (K2)
+            if is_alert = '0' and reg_p = "10" then
+                if pulse_count < 9 then pulse_count <= pulse_count + 1; end if;
+            end if;
+
+            -- 5. ТАЙМЕР 10 СЕКУНД
+            if timer_10s = T_10_SEC - 1 then
+                timer_10s <= 0;
+                send_trigger <= '1';            
+                count_to_send <= pulse_count;   
+
+                if is_alert = '0' then
+                    if pulse_count > 5 then
+                        is_alert <= '1';
+                    end if;
+                    pulse_count <= 0; 
+                end if;
+            else 
+                timer_10s <= timer_10s + 1; 
+                send_trigger <= '0'; 
+            end if;
+        end if;
+    end process;
+
+    -- ПРОЦЕСС 2: Менеджер отправки сообщений UART
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if send_trigger = '1' then
+                msg_step <= 1; 
+            elsif msg_step > 0 and tx_busy = '0' and tx_start = '0' then
+                tx_start <= '1'; 
+                
+                if is_alert = '0' then
+                    -- Норма
+                    case msg_step is
+                        when 1 => tx_data_reg <= "00110000" + count_to_send; 
+                        when 2 => tx_data_reg <= x"0D"; -- \r
+                        when 3 => tx_data_reg <= x"0A"; -- \n
+                        when others => tx_start <= '0'; msg_step <= 0; 
+                    end case;
+                else
+                    -- Тревога: "ALERT!\r\n"
+                    case msg_step is
+                        when 1 => tx_data_reg <= x"41"; -- 'A'
+                        when 2 => tx_data_reg <= x"4C"; -- 'L'
+                        when 3 => tx_data_reg <= x"45"; -- 'E'
+                        when 4 => tx_data_reg <= x"52"; -- 'R'
+                        when 5 => tx_data_reg <= x"54"; -- 'T'
+                        when 6 => tx_data_reg <= x"21"; -- '!'
+                        when 7 => tx_data_reg <= x"0D"; -- '\r'
+                        when 8 => tx_data_reg <= x"0A"; -- '\n'
+                        when others => tx_start <= '0'; msg_step <= 0;
+                    end case;
+                end if;
+                
+                if msg_step > 0 and msg_step < 9 then 
+                    msg_step <= msg_step + 1; 
+                end if;
+            else
+                tx_start <= '0'; 
+            end if;
+        end if;
+    end process;
+
+    -- ПРОЦЕСС 3: Низкоуровневый передатчик UART
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            case tx_state is
+                when IDLE =>
+                    tx <= '1'; 
+                    tx_busy <= '0';
+                    if tx_start = '1' then
+                        tx_state <= START_BIT;
+                        tx_busy <= '1';
+                        baud_cnt <= 0;
+                    end if;
+
+                when START_BIT =>
+                    tx <= '0'; 
+                    if baud_cnt = BAUD_TICK - 1 then
+                        baud_cnt <= 0;
+                        tx_state <= DATA_BITS;
+                        bit_idx <= 0;
+                    else baud_cnt <= baud_cnt + 1; end if;
+
+                when DATA_BITS =>
+                    tx <= tx_data_reg(bit_idx); 
+                    if baud_cnt = BAUD_TICK - 1 then
+                        baud_cnt <= 0;
+                        if bit_idx = 7 then
+                            tx_state <= STOP_BIT;
+                        else bit_idx <= bit_idx + 1; end if;
+                    else baud_cnt <= baud_cnt + 1; end if;
+
+                when STOP_BIT =>
+                    tx <= '1'; 
+                    if baud_cnt = BAUD_TICK - 1 then
+                        baud_cnt <= 0;
+                        tx_state <= IDLE;
+                    else baud_cnt <= baud_cnt + 1; end if;
+            end case;
+        end if;
+    end process;
+
+    -- ПРОЦЕСС 4: Вывод на экран
+    process(scan_cnt, is_alert, pulse_count)
+    begin
+        dig <= (others => '1'); 
+        dig(scan_cnt) <= '0'; 
+
+        if is_alert = '1' then
+            case scan_cnt is
+                when 7 => seg <= "10001000"; -- A
+                when 6 => seg <= "11000111"; -- L
+                when 5 => seg <= "10000110"; -- E
+                when 4 => seg <= "10101111"; -- r
+                when 3 => seg <= "10000111"; -- t
+                when others => seg <= "11111111";
+            end case;
+        else
+            if scan_cnt = 0 then
+                case pulse_count is
+                    when 0 => seg <= "11000000"; when 1 => seg <= "11111001";
+                    when 2 => seg <= "10100100"; when 3 => seg <= "10110000";
+                    when 4 => seg <= "10011001"; when 5 => seg <= "10010010";
+                    when 6 => seg <= "10000010"; when 7 => seg <= "11111000";
+                    when 8 => seg <= "10000000"; when 9 => seg <= "10010000";
+                    when others => seg <= "11111111";
+                end case;
+            else seg <= "11111111"; end if;
+        end if;
+    end process;
+
+end Behavioral;
